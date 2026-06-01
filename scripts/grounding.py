@@ -476,25 +476,42 @@ def visualize_slam_map(
             text_norm = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-8)
             sim = (text_norm @ point_norm.T).squeeze(0)  # (N,)
 
-            # Speech context boost (only when sidecar is loaded)
+            # Speech context boost (only when sidecar is loaded).
+            # Embed each unique context string with the same language model and
+            # use cosine similarity to the query as the boost magnitude — so
+            # semantically related speech ("living room sofa") boosts a query
+            # like "places to sit and relax" without needing word overlap.
             if speech_context is not None and packinfo is not None and frame_inds:
-                query_lower = main_prompt.lower()
+                # Embed all unique non-null context strings in one batch.
+                unique_ctxs = list({v for v in speech_context.values() if v})
+                ctx_sims: dict[str, float] = {}
+                if unique_ctxs:
+                    ctx_embeds = encoder.encode_labels(unique_ctxs).to(torch_device)
+                    ctx_embeds = ctx_embeds / (ctx_embeds.norm(dim=-1, keepdim=True) + 1e-8)
+                    sims = (text_norm @ ctx_embeds.T).squeeze(0)  # (n_unique,)
+                    ctx_sims = {ctx: float(s.item()) for ctx, s in zip(unique_ctxs, sims)}
+                    print(f"Speech context: {len(unique_ctxs)} unique segments, "
+                          f"sim range [{min(ctx_sims.values()):.3f}, {max(ctx_sims.values()):.3f}]")
+
                 all_boost = torch.zeros(len(xyz), dtype=torch.float32)
                 for kf_i, frame_ind in enumerate(frame_inds):
                     ctx = speech_context.get(str(frame_ind))
-                    if ctx and query_lower in ctx.lower():
+                    if not ctx:
+                        continue
+                    ctx_sim = ctx_sims.get(ctx, 0.0)
+                    if ctx_sim > 0:
                         start = int(packinfo[kf_i, 0, 0].item())
                         count = int(packinfo[kf_i, 0, 1].item())
-                        all_boost[start : start + count] = 1.0
-                # Align boost with the same valid-embedding filter applied above
+                        all_boost[start : start + count] = ctx_sim
+
+                # Align boost with the same valid-embedding filter applied above.
                 if embedding_valid is not None:
                     boost = all_boost[embedding_valid.cpu()]
                 else:
                     boost = all_boost
                 n_boosted = int((boost > 0).sum().item())
-                if n_boosted > 0:
-                    print(f"Speech boost: +{speech_weight} applied to {n_boosted} points "
-                          f"(context matched '{main_prompt}')")
+                print(f"Speech boost: +{speech_weight} * ctx_sim applied to "
+                      f"{n_boosted} points")
                 sim = sim + speech_weight * boost.to(sim.device)
 
             sim_np = sim.cpu().detach().numpy()

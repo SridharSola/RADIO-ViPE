@@ -60,7 +60,7 @@ Verify:
 
 STEP 3 — APPLY THE CODE FIX
 --------------------------------------------------------------------------------
-Already included in this fork (SridharSola/RADIO-ViPE-speech). Nothing to do.
+Already included in this repo (SridharSola/RADIO-ViPE). Nothing to do.
 
 
 STEP 4 — UPLOAD YOUR VIDEO

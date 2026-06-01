@@ -333,6 +333,256 @@ def cluster_object_points(
 # Main visualization
 # ---------------------------------------------------------------------------
 
+def load_session(
+    map_path: Path,
+    device: str = "cpu",
+    pca_basis_path: Path | None = None,
+    model_version: str = "c-radio_v3-b",
+    lang_model: str = "siglip2",
+    scra_scaling: float = 10.0,
+    scga_scaling: float = 10.0,
+    window_size: int = 336,
+    window_stride: int = 224,
+    gt_poses_path: Path | None = None,
+    speech_context_path: Path | None = None,
+) -> dict:
+    """Load map, decompress embeddings, init encoder, and pre-normalise everything.
+
+    This is the slow step (~1-3 min). Call it once, then pass the returned
+    session dict to run_query() for each prompt.
+    """
+    print(f"Loading SLAM map from: {map_path}")
+    data = load_slam_map(map_path, device=device)
+
+    xyz = data["dense_disp_xyz"]
+    rgb = data["dense_disp_rgb"]
+    embeddings_raw = data.get("dense_disp_embeddings")
+    embeddings_full = data.get("dense_disp_embeddings_full")
+    embedding_valid = data.get("dense_disp_embedding_valid")
+    packinfo = data.get("dense_disp_packinfo")
+    frame_inds: list[int] = data.get("dense_disp_frame_inds", [])
+
+    print(f"Point cloud size: {xyz.shape[0]} points")
+
+    # Resolve embeddings
+    if embeddings_full is not None:
+        print("Using pre-decompressed embeddings.")
+        embeddings_for_vis = embeddings_full
+    elif embeddings_raw is not None and pca_basis_path is not None:
+        print("Decompressing embeddings ...")
+        embeddings_for_vis = decompress_embeddings(embeddings_raw, pca_basis_path, device)
+        print(f"  shape: {embeddings_for_vis.shape}")
+    else:
+        embeddings_for_vis = embeddings_raw
+        if embeddings_raw is None:
+            print("No embeddings found in map.")
+
+    # Convert point cloud to numpy and align
+    xyz_np = xyz.cpu().numpy()
+    rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
+    if gt_poses_path is not None:
+        first_pose = load_first_gt_pose(gt_poses_path)
+        xyz_np = transform_pointcloud(first_pose, xyz_np)
+        scene_rotation = np.eye(3)
+    else:
+        scene_rotation = get_scene_orientation(xyz_np)
+
+    # Filter to valid embeddings
+    torch_device = _resolve_device(device)
+    if embeddings_for_vis is not None:
+        if embedding_valid is not None:
+            valid_mask = embedding_valid.cpu().numpy()
+            grounding_embeddings = embeddings_for_vis[embedding_valid]
+            grounding_xyz = xyz_np[valid_mask]
+            print(f"Valid embeddings: {grounding_embeddings.shape[0]} / {embeddings_for_vis.shape[0]}")
+        else:
+            grounding_embeddings = embeddings_for_vis
+            grounding_xyz = xyz_np
+
+        # Pre-normalise point embeddings — reused across all queries
+        grounding_embeddings = grounding_embeddings.to(torch_device, dtype=torch.float32)
+        point_norm = grounding_embeddings / (grounding_embeddings.norm(dim=-1, keepdim=True) + 1e-8)
+        print(f"Point embeddings pre-normalised: {point_norm.shape}")
+    else:
+        point_norm = None
+        grounding_xyz = xyz_np
+
+    # Init encoder
+    print("Loading RADSegEncoder ...")
+    try:
+        encoder = RADSegEncoder(
+            model_version=model_version,
+            lang_model=lang_model,
+            scra_scaling=scra_scaling,
+            scga_scaling=scga_scaling,
+            slide_crop=window_size,
+            slide_stride=window_stride,
+            sam_refinement=False,
+            predict=False,
+            device=torch_device,
+        )
+    except Exception as e:
+        print(f"Failed to initialise RADSegEncoder: {e}")
+        encoder = None
+
+    # Load speech context and pre-embed all unique context strings
+    speech_context: dict | None = None
+    ctx_norm: torch.Tensor | None = None   # (n_unique, D) normalised
+    unique_ctxs: list[str] = []
+    point_ctx_sim: torch.Tensor | None = None  # (N_all,) per-point ctx embedding index
+
+    if speech_context_path is not None:
+        with open(speech_context_path) as f:
+            speech_context = json.load(f)
+        covered = sum(1 for v in speech_context.values() if v is not None)
+        print(f"Speech context: {covered}/{len(speech_context)} keyframes covered")
+
+        if encoder is not None and packinfo is not None and frame_inds:
+            unique_ctxs = list({v for v in speech_context.values() if v})
+            if unique_ctxs:
+                print(f"Pre-embedding {len(unique_ctxs)} unique context strings ...")
+                raw = encoder.encode_labels(unique_ctxs).to(torch_device, dtype=torch.float32)
+                ctx_norm = raw / (raw.norm(dim=-1, keepdim=True) + 1e-8)
+
+                # Build a per-point tensor that maps each point → its ctx embed index
+                # (-1 means no context). Computed once, reused per query.
+                ctx_idx_map = {ctx: i for i, ctx in enumerate(unique_ctxs)}
+                all_ctx_idx = torch.full((len(xyz),), -1, dtype=torch.long)
+                for kf_i, frame_ind in enumerate(frame_inds):
+                    ctx = speech_context.get(str(frame_ind))
+                    if not ctx:
+                        continue
+                    idx = ctx_idx_map.get(ctx, -1)
+                    if idx >= 0:
+                        start = int(packinfo[kf_i, 0, 0].item())
+                        count = int(packinfo[kf_i, 0, 1].item())
+                        all_ctx_idx[start : start + count] = idx
+
+                # Filter to valid points (same mask as embeddings)
+                if embedding_valid is not None:
+                    point_ctx_idx = all_ctx_idx[embedding_valid.cpu()]
+                else:
+                    point_ctx_idx = all_ctx_idx
+                # Store as a float tensor: ctx embed index per valid point
+                point_ctx_sim = point_ctx_idx  # renamed for clarity below
+                print("Speech context pre-embedded and mapped to points.")
+
+    return {
+        "map_path": map_path,
+        "xyz_np": xyz_np,
+        "rgb_np": rgb_np,
+        "point_norm": point_norm,        # (N_valid, D) pre-normalised, on device
+        "grounding_xyz": grounding_xyz,  # (N_valid, 3) numpy
+        "scene_rotation": scene_rotation,
+        "encoder": encoder,
+        "torch_device": torch_device,
+        "speech_context": speech_context,
+        "ctx_norm": ctx_norm,            # (n_unique, D) pre-normalised context embeds
+        "unique_ctxs": unique_ctxs,
+        "point_ctx_idx": point_ctx_sim,  # (N_valid,) long tensor, -1 = no context
+    }
+
+
+def run_query(
+    session: dict,
+    prompt: str,
+    out_rrd: Path,
+    similarity_threshold: float = 0.25,
+    bbox_expansion: float = 1.0,
+    show_object_points: bool = False,
+    no_bbox: bool = False,
+    cluster_eps: float | None = None,
+    cluster_min_samples: int | None = None,
+    speech_weight: float = 0.3,
+) -> None:
+    """Run a single grounding query against a pre-loaded session. Fast (~seconds)."""
+    xyz_np       = session["xyz_np"]
+    rgb_np       = session["rgb_np"]
+    point_norm   = session["point_norm"]
+    grounding_xyz = session["grounding_xyz"]
+    scene_rotation = session["scene_rotation"]
+    encoder      = session["encoder"]
+    torch_device = session["torch_device"]
+    ctx_norm     = session["ctx_norm"]
+    unique_ctxs  = session["unique_ctxs"]
+    point_ctx_idx = session["point_ctx_idx"]
+
+    # Start a fresh Rerun recording for this query
+    rr.init("SLAM Map Grounding")
+    rr.save(str(out_rrd))
+    rr.log("world/points/rgb", rr.Points3D(positions=xyz_np, colors=rgb_np, radii=0.01))
+    rr.log("world/axes", rr.LineStrips3D([
+        [[0, 0, 0], [1, 0, 0]],
+        [[0, 0, 0], [0, 1, 0]],
+        [[0, 0, 0], [0, 0, 1]],
+    ]))
+
+    if point_norm is None or encoder is None:
+        print("No embeddings or encoder — point cloud saved without grounding.")
+        return
+
+    print(f"\n--- Grounding: '{prompt}' ---")
+    text_embeds = encoder.encode_labels([prompt]).to(torch_device, dtype=torch.float32)
+    text_norm = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-8)
+
+    # Cosine similarity: (1, D) x (D, N) → (N,)
+    sim = (text_norm @ point_norm.T).squeeze(0)
+
+    # Speech boost: dot query embedding against pre-computed context embeddings
+    if ctx_norm is not None and point_ctx_idx is not None:
+        ctx_sims = (text_norm @ ctx_norm.T).squeeze(0)  # (n_unique,)
+        # Map per-point context index → context similarity score
+        boost_scores = torch.zeros(len(point_ctx_idx), dtype=torch.float32, device=torch_device)
+        has_ctx = point_ctx_idx >= 0
+        boost_scores[has_ctx] = ctx_sims[point_ctx_idx[has_ctx].to(torch_device)]
+        n_boosted = int(has_ctx.sum().item())
+        sim_range = f"[{ctx_sims.min():.3f}, {ctx_sims.max():.3f}]"
+        print(f"Speech boost: {n_boosted} points boosted, ctx sim range {sim_range}")
+        sim = sim + speech_weight * boost_scores
+
+    sim_np = sim.cpu().detach().numpy()
+    print(f"Similarity stats: min={sim_np.min():.4f}, max={sim_np.max():.4f}, "
+          f"mean={sim_np.mean():.4f}, std={sim_np.std():.4f}")
+
+    mask_t, used_threshold, info = find_grounding_threshold(
+        sim, initial_threshold=similarity_threshold,
+        target_std=0.015, min_threshold=0.05, threshold_step=0.01, min_points=10,
+    )
+    mask = mask_t.cpu().numpy()
+    num_found = int(mask.sum())
+
+    if abs(used_threshold - similarity_threshold) > 1e-6:
+        print(f"Adaptive threshold: {similarity_threshold:.4f} → {used_threshold:.4f} "
+              f"({info['steps']} step(s))")
+    if info.get("fallback"):
+        print(f"⚠️  Fallback to top-{info['fallback_k']} points.")
+
+    print(f"Found {num_found} points above {used_threshold:.4f}")
+
+    if num_found > 0:
+        object_points = grounding_xyz[mask]
+        if show_object_points:
+            rr.log(f"world/objects/{prompt}_points",
+                   rr.Points3D(positions=object_points, colors=[255, 0, 0], radii=0.015))
+        if not no_bbox:
+            clusters = cluster_object_points(object_points, eps=cluster_eps,
+                                             min_samples=cluster_min_samples)
+            print(f"Found {len(clusters)} cluster(s).")
+            for i, cluster_pts in enumerate(clusters):
+                obj_center, obj_size, obj_quat = compute_aligned_bbox(
+                    cluster_pts, scene_rotation, expansion=bbox_expansion)
+                if obj_center is None:
+                    continue
+                rr.log(f"world/objects/{prompt}/instance_{i}",
+                       rr.Boxes3D(centers=[obj_center], sizes=[obj_size],
+                                  quaternions=[obj_quat], colors=[0, 255, 0, 180],
+                                  labels=[f"{prompt} #{i}"]))
+    else:
+        print(f"No points found for '{prompt}'.")
+
+    print(f"Saved → {out_rrd}")
+
+
 def visualize_slam_map(
     map_path: Path,
     device: str = "cpu",
@@ -359,250 +609,36 @@ def visualize_slam_map(
     # Output
     output_path: Path | None = None,
 ) -> None:
-    """Load a SLAM map, render it in Rerun, and optionally highlight a
-    grounded text prompt as colored points and per-instance bounding boxes."""
-
-    print(f"Loading SLAM map from: {map_path}")
-    data = load_slam_map(map_path, device=device)
-
-    # --- Extract data ---
-    xyz = data["dense_disp_xyz"]
-    rgb = data["dense_disp_rgb"]
-    embeddings_raw = data.get("dense_disp_embeddings")
-    embeddings_full = data.get("dense_disp_embeddings_full")
-    embedding_valid = data.get("dense_disp_embedding_valid")
-    packinfo = data.get("dense_disp_packinfo")          # (N_kf, V, 2) [start, count]
-    frame_inds: list[int] = data.get("dense_disp_frame_inds", [])
-
-    # --- Load speech context sidecar (optional) ---
-    speech_context: dict[str, str | None] | None = None
-    if speech_context_path is not None:
-        with open(speech_context_path) as f:
-            speech_context = json.load(f)
-        covered = sum(1 for v in speech_context.values() if v is not None)
-        print(f"Speech context loaded: {covered}/{len(speech_context)} keyframes have context")
-
-    print(f"Point cloud size: {xyz.shape[0]} points")
-
-    # --- Resolve embeddings (decompress if necessary) ---
-    if embeddings_full is not None:
-        print("Using pre-decompressed embeddings from 'dense_disp_embeddings_full'.")
-        embeddings_for_vis = embeddings_full
-    elif embeddings_raw is not None and pca_basis_path is not None:
-        print("Decompressing embeddings using PcaCompressor...")
-        embeddings_for_vis = decompress_embeddings(embeddings_raw, pca_basis_path, device)
-        print(f"Decompressed shape: {embeddings_for_vis.shape}")
-    else:
-        embeddings_for_vis = embeddings_raw
-        if embeddings_raw is None:
-            print("No embeddings found in map.")
-
-    print(f"Has embeddings: {embeddings_for_vis is not None}")
-
-    # --- Convert to numpy and align ---
-    xyz_np = xyz.cpu().numpy()
-    rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)  # original RGB is in [0, 1]
-    if gt_poses_path is not None:
-        first_pose = load_first_gt_pose(gt_poses_path)
-        xyz_np = transform_pointcloud(first_pose, xyz_np)
-        # Aligned to GT frame → use identity; bounding boxes will be axis-aligned
-        # to the GT world axes rather than to a PCA-derived scene frame.
-        scene_rotation = np.eye(3)
-    else:
-        scene_rotation = get_scene_orientation(xyz_np)
-
-    # --- Initialize Rerun and save to file ---
-    rr.init("SLAM Map Grounding")
+    """Load a SLAM map and run a single grounding query. Thin wrapper around
+    load_session() + run_query(). For multiple queries use --interactive."""
+    session = load_session(
+        map_path=map_path, device=device, pca_basis_path=pca_basis_path,
+        model_version=model_version, lang_model=lang_model,
+        scra_scaling=scra_scaling, scga_scaling=scga_scaling,
+        window_size=window_size, window_stride=window_stride,
+        gt_poses_path=gt_poses_path, speech_context_path=speech_context_path,
+    )
     out_rrd = output_path if output_path is not None else map_path.with_suffix(".rrd")
-    rr.save(str(out_rrd))
-    print(f"Rerun recording → {out_rrd}")
-    rr.log(
-        "world/points/rgb",
-        rr.Points3D(positions=xyz_np, colors=rgb_np, radii=0.01),
-    )
-
-    # --- Grounding ---
-    if ground_prompts and embeddings_for_vis is not None:
-        print("\n--- Grounding ---")
-        main_prompt = ground_prompts[0]
-        print(f"Highlighting: '{main_prompt}' (threshold={similarity_threshold})")
-
-        # Filter to valid embeddings if a mask is provided
-        if embedding_valid is not None:
-            valid_mask = embedding_valid.cpu().numpy()
-            grounding_embeddings = embeddings_for_vis[embedding_valid]
-            grounding_xyz = xyz_np[valid_mask]
-            print(
-                f"Valid embeddings: {grounding_embeddings.shape[0]} / "
-                f"{embeddings_for_vis.shape[0]}"
-            )
-        else:
-            grounding_embeddings = embeddings_for_vis
-            grounding_xyz = xyz_np
-
-        # Initialize RADSegEncoder
-        torch_device = _resolve_device(device)
-        try:
-            encoder = RADSegEncoder(
-                model_version=model_version,
-                lang_model=lang_model,
-                scra_scaling=scra_scaling,
-                scga_scaling=scga_scaling,
-                slide_crop=window_size,
-                slide_stride=window_stride,
-                sam_refinement=False,
-                predict=False,
-                device=torch_device,
-            )
-        except Exception as e:
-            print(f"Failed to initialize RADSegEncoder: {e}")
-            encoder = None
-
-        if encoder is not None:
-            # Encode text prompt
-            text_embeds = encoder.encode_labels([main_prompt]).to(torch_device)
-            print(f"Text embedding shape: {text_embeds.shape}")
-            print(f"Point embedding shape: {grounding_embeddings.shape}")
-
-            grounding_embeddings = grounding_embeddings.to(
-                device=torch_device, dtype=torch.float32
-            )
-            text_embeds = text_embeds.to(device=torch_device, dtype=torch.float32)
-
-            # Cosine similarity
-            point_norm = grounding_embeddings / (
-                grounding_embeddings.norm(dim=-1, keepdim=True) + 1e-8
-            )
-            text_norm = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-8)
-            sim = (text_norm @ point_norm.T).squeeze(0)  # (N,)
-
-            # Speech context boost (only when sidecar is loaded).
-            # Embed each unique context string with the same language model and
-            # use cosine similarity to the query as the boost magnitude — so
-            # semantically related speech ("living room sofa") boosts a query
-            # like "places to sit and relax" without needing word overlap.
-            if speech_context is not None and packinfo is not None and frame_inds:
-                # Embed all unique non-null context strings in one batch.
-                unique_ctxs = list({v for v in speech_context.values() if v})
-                ctx_sims: dict[str, float] = {}
-                if unique_ctxs:
-                    ctx_embeds = encoder.encode_labels(unique_ctxs).to(torch_device)
-                    ctx_embeds = ctx_embeds / (ctx_embeds.norm(dim=-1, keepdim=True) + 1e-8)
-                    sims = (text_norm @ ctx_embeds.T).squeeze(0)  # (n_unique,)
-                    ctx_sims = {ctx: float(s.item()) for ctx, s in zip(unique_ctxs, sims)}
-                    print(f"Speech context: {len(unique_ctxs)} unique segments, "
-                          f"sim range [{min(ctx_sims.values()):.3f}, {max(ctx_sims.values()):.3f}]")
-
-                all_boost = torch.zeros(len(xyz), dtype=torch.float32)
-                for kf_i, frame_ind in enumerate(frame_inds):
-                    ctx = speech_context.get(str(frame_ind))
-                    if not ctx:
-                        continue
-                    ctx_sim = ctx_sims.get(ctx, 0.0)
-                    if ctx_sim > 0:
-                        start = int(packinfo[kf_i, 0, 0].item())
-                        count = int(packinfo[kf_i, 0, 1].item())
-                        all_boost[start : start + count] = ctx_sim
-
-                # Align boost with the same valid-embedding filter applied above.
-                if embedding_valid is not None:
-                    boost = all_boost[embedding_valid.cpu()]
-                else:
-                    boost = all_boost
-                n_boosted = int((boost > 0).sum().item())
-                print(f"Speech boost: +{speech_weight} * ctx_sim applied to "
-                      f"{n_boosted} points")
-                sim = sim + speech_weight * boost.to(sim.device)
-
-            sim_np = sim.cpu().detach().numpy()
-            full_std = float(sim.std().item())
-            print(
-                f"Similarity stats: min={sim_np.min():.4f}, max={sim_np.max():.4f}, "
-                f"mean={sim_np.mean():.4f}, std={full_std:.4f}"
-            )
-
-            # Adaptive threshold
-            mask_t, used_threshold, info = find_grounding_threshold(
-                sim,
-                initial_threshold=similarity_threshold,
-                target_std=0.015,
-                min_threshold=0.05,
-                threshold_step=0.01,
-                min_points=10,
-            )
-            mask = mask_t.cpu().numpy()
-            num_found = int(mask.sum())
-
-            if abs(used_threshold - similarity_threshold) > 1e-6:
-                print(
-                    f"Adaptive threshold: {similarity_threshold:.4f} → "
-                    f"{used_threshold:.4f} ({info['steps']} step(s))"
-                )
-            if info.get("fallback"):
-                print(
-                    f"⚠️  No threshold met target std=0.015; "
-                    f"falling back to top-{info['fallback_k']} points."
-                )
-
-            print(
-                f"Found {num_found} points above {used_threshold:.4f} "
-                f"(selected std={info['selected_std']:.4f}, "
-                f"range=[{info['selected_min']:.4f}, {info['selected_max']:.4f}])"
-            )
-
-            if num_found > 0:
-                object_points = grounding_xyz[mask]
-
-                # Highlight matching points in red
-                if show_object_points:
-                    rr.log(
-                        f"world/objects/{main_prompt}_points",
-                        rr.Points3D(
-                            positions=object_points,
-                            colors=[255, 0, 0],
-                            radii=0.015,
-                        ),
-                    )
-
-                # Per-instance bounding boxes via DBSCAN
-                if not no_bbox:
-                    clusters = cluster_object_points(
-                        object_points,
-                        eps=cluster_eps,
-                        min_samples=cluster_min_samples,
-                    )
-                    print(f"Found {len(clusters)} cluster(s) for '{main_prompt}'.")
-
-                    for i, cluster_pts in enumerate(clusters):
-                        obj_center, obj_size, obj_quat = compute_aligned_bbox(
-                            cluster_pts, scene_rotation, expansion=bbox_expansion
-                        )
-                        if obj_center is None:
-                            continue
-                        rr.log(
-                            f"world/objects/{main_prompt}/instance_{i}",
-                            rr.Boxes3D(
-                                centers=[obj_center],
-                                sizes=[obj_size],
-                                quaternions=[obj_quat],
-                                colors=[0, 255, 0, 180],
-                                labels=[f"{main_prompt} #{i}"],
-                            ),
-                        )
-            else:
-                print(f"No points found for '{main_prompt}'.")
-
-    # --- Coordinate frame at origin ---
-    rr.log(
-        "world/axes",
-        rr.LineStrips3D([
-            [[0, 0, 0], [1, 0, 0]],
-            [[0, 0, 0], [0, 1, 0]],
-            [[0, 0, 0], [0, 0, 1]],
-        ]),
-    )
-
-    print(f"\nDone. Download and open locally with:\n  rerun {out_rrd.name}")
+    if ground_prompts:
+        run_query(session, ground_prompts[0], out_rrd,
+                  similarity_threshold=similarity_threshold,
+                  bbox_expansion=bbox_expansion,
+                  show_object_points=show_object_points,
+                  no_bbox=no_bbox, cluster_eps=cluster_eps,
+                  cluster_min_samples=cluster_min_samples,
+                  speech_weight=speech_weight)
+    else:
+        # No prompt — just save the point cloud
+        rr.init("SLAM Map Grounding")
+        rr.save(str(out_rrd))
+        rr.log("world/points/rgb",
+               rr.Points3D(positions=session["xyz_np"],
+                           colors=session["rgb_np"], radii=0.01))
+        rr.log("world/axes", rr.LineStrips3D([
+            [[0, 0, 0], [1, 0, 0]], [[0, 0, 0], [0, 1, 0]], [[0, 0, 0], [0, 0, 1]],
+        ]))
+        print(f"Saved → {out_rrd}")
+    print(f"\nDownload and open locally with:\n  rerun {out_rrd.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +801,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # Interactive mode
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help=(
+            "Load the map and model once, then accept queries in a loop. "
+            "Each query writes its own <prompt>.rrd file. Much faster for "
+            "multiple queries — model loads only once."
+        ),
+    )
+
     return parser
 
 
@@ -788,28 +835,61 @@ def main() -> None:
         else:
             print("Warning: --ground provided but no valid prompts found.")
 
-    visualize_slam_map(
-        map_path=args.map_path,
-        device=args.device,
-        pca_basis_path=args.pca_basis,
-        ground_prompts=ground_prompts,
-        similarity_threshold=args.threshold,
-        bbox_expansion=args.bbox_expansion,
-        model_version=args.model_version,
-        lang_model=args.lang_model,
-        scra_scaling=args.scra_scaling,
-        scga_scaling=args.scga_scaling,
-        window_size=args.window_size,
-        window_stride=args.window_stride,
-        gt_poses_path=args.gt_poses_path,
-        show_object_points=args.show_object_points,
-        no_bbox=args.no_bbox,
-        cluster_eps=args.cluster_eps,
-        cluster_min_samples=args.cluster_min_samples,
-        speech_context_path=args.speech_context,
-        speech_weight=args.speech_weight,
-        output_path=args.output,
-    )
+    if args.interactive:
+        # Load once, query many times
+        session = load_session(
+            map_path=args.map_path, device=args.device,
+            pca_basis_path=args.pca_basis,
+            model_version=args.model_version, lang_model=args.lang_model,
+            scra_scaling=args.scra_scaling, scga_scaling=args.scga_scaling,
+            window_size=args.window_size, window_stride=args.window_stride,
+            gt_poses_path=args.gt_poses_path,
+            speech_context_path=args.speech_context,
+        )
+        base_dir = args.output.parent if args.output else args.map_path.parent
+        print("\nReady. Type a query and press Enter. Empty line or Ctrl+C to exit.\n")
+        while True:
+            try:
+                prompt = input("Query> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting.")
+                break
+            if not prompt:
+                break
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in prompt)
+            out_rrd = base_dir / f"grounding_{safe}.rrd"
+            run_query(session, prompt, out_rrd,
+                      similarity_threshold=args.threshold,
+                      bbox_expansion=args.bbox_expansion,
+                      show_object_points=args.show_object_points,
+                      no_bbox=args.no_bbox,
+                      cluster_eps=args.cluster_eps,
+                      cluster_min_samples=args.cluster_min_samples,
+                      speech_weight=args.speech_weight)
+            print(f"  → scp to local and run: rerun {out_rrd.name}\n")
+    else:
+        visualize_slam_map(
+            map_path=args.map_path,
+            device=args.device,
+            pca_basis_path=args.pca_basis,
+            ground_prompts=ground_prompts,
+            similarity_threshold=args.threshold,
+            bbox_expansion=args.bbox_expansion,
+            model_version=args.model_version,
+            lang_model=args.lang_model,
+            scra_scaling=args.scra_scaling,
+            scga_scaling=args.scga_scaling,
+            window_size=args.window_size,
+            window_stride=args.window_stride,
+            gt_poses_path=args.gt_poses_path,
+            show_object_points=args.show_object_points,
+            no_bbox=args.no_bbox,
+            cluster_eps=args.cluster_eps,
+            cluster_min_samples=args.cluster_min_samples,
+            speech_context_path=args.speech_context,
+            speech_weight=args.speech_weight,
+            output_path=args.output,
+        )
 
 
 if __name__ == "__main__":

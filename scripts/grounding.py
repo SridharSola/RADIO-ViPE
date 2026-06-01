@@ -19,6 +19,7 @@ Pipeline:
 """
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
@@ -352,6 +353,9 @@ def visualize_slam_map(
     no_bbox: bool = False,
     cluster_eps: float | None = None,
     cluster_min_samples: int | None = None,
+    # Speech context
+    speech_context_path: Path | None = None,
+    speech_weight: float = 0.3,
 ) -> None:
     """Load a SLAM map, render it in Rerun, and optionally highlight a
     grounded text prompt as colored points and per-instance bounding boxes."""
@@ -365,6 +369,16 @@ def visualize_slam_map(
     embeddings_raw = data.get("dense_disp_embeddings")
     embeddings_full = data.get("dense_disp_embeddings_full")
     embedding_valid = data.get("dense_disp_embedding_valid")
+    packinfo = data.get("dense_disp_packinfo")          # (N_kf, V, 2) [start, count]
+    frame_inds: list[int] = data.get("dense_disp_frame_inds", [])
+
+    # --- Load speech context sidecar (optional) ---
+    speech_context: dict[str, str | None] | None = None
+    if speech_context_path is not None:
+        with open(speech_context_path) as f:
+            speech_context = json.load(f)
+        covered = sum(1 for v in speech_context.values() if v is not None)
+        print(f"Speech context loaded: {covered}/{len(speech_context)} keyframes have context")
 
     print(f"Point cloud size: {xyz.shape[0]} points")
 
@@ -456,6 +470,27 @@ def visualize_slam_map(
             )
             text_norm = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-8)
             sim = (text_norm @ point_norm.T).squeeze(0)  # (N,)
+
+            # Speech context boost (only when sidecar is loaded)
+            if speech_context is not None and packinfo is not None and frame_inds:
+                query_lower = main_prompt.lower()
+                all_boost = torch.zeros(len(xyz), dtype=torch.float32)
+                for kf_i, frame_ind in enumerate(frame_inds):
+                    ctx = speech_context.get(str(frame_ind))
+                    if ctx and query_lower in ctx.lower():
+                        start = int(packinfo[kf_i, 0, 0].item())
+                        count = int(packinfo[kf_i, 0, 1].item())
+                        all_boost[start : start + count] = 1.0
+                # Align boost with the same valid-embedding filter applied above
+                if embedding_valid is not None:
+                    boost = all_boost[embedding_valid.cpu()]
+                else:
+                    boost = all_boost
+                n_boosted = int((boost > 0).sum().item())
+                if n_boosted > 0:
+                    print(f"Speech boost: +{speech_weight} applied to {n_boosted} points "
+                          f"(context matched '{main_prompt}')")
+                sim = sim + speech_weight * boost.to(sim.device)
 
             sim_np = sim.cpu().detach().numpy()
             full_std = float(sim.std().item())
@@ -675,6 +710,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="DBSCAN min_samples for core points (default: 10).",
     )
 
+    # Speech context
+    parser.add_argument(
+        "--speech-context",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a speech context JSON sidecar produced by build_speech_context.py. "
+            "When provided, points whose recorded context matches the query get a "
+            "similarity boost (controlled by --speech-weight)."
+        ),
+    )
+    parser.add_argument(
+        "--speech-weight",
+        type=float,
+        default=0.3,
+        help=(
+            "Additive boost applied to cosine similarity for points whose speech "
+            "context matches the query (default: 0.3). Higher → speech context "
+            "dominates; lower → visual similarity dominates."
+        ),
+    )
+
     return parser
 
 
@@ -716,6 +773,8 @@ def main() -> None:
         no_bbox=args.no_bbox,
         cluster_eps=args.cluster_eps,
         cluster_min_samples=args.cluster_min_samples,
+        speech_context_path=args.speech_context,
+        speech_weight=args.speech_weight,
     )
 
 

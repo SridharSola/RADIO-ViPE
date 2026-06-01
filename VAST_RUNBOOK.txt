@@ -1,0 +1,284 @@
+================================================================================
+RADIO-ViPE on Vast.ai — Runbook
+================================================================================
+Last updated: 2026-06-01
+This file lives in the repo root. Read it top to bottom for a fresh instance.
+================================================================================
+
+
+STEP 0 — PROVISION THE INSTANCE
+--------------------------------------------------------------------------------
+On Vast.ai console:
+
+  Docker image:   pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
+  Disk:           >= 30 GB
+  GPU:            RTX 3090 (24 GB). VERIFY after launch — some instances report
+                  24 GB but are actually 11 GB. Run:
+                    nvidia-smi
+                  and check "24564MiB" in the memory column. If not 24 GB,
+                  destroy and reprovision.
+
+  On-start script (paste into the field before launching):
+    apt-get update && apt-get install -y git ninja-build cmake build-essential libopenblas-dev libeigen3-dev ffmpeg libsm6 libxext6
+
+  Launch mode: Jupyter + SSH
+
+
+STEP 1 — CONNECT
+--------------------------------------------------------------------------------
+SSH details are under the ">" button on the instance row in the Vast console.
+Command looks like:
+  ssh -p 40680 -i ~/.ssh/id_ed25519_vast root@107.218.0.18
+
+Port and IP change every time you reprovision. Key is always id_ed25519_vast.
+
+Start tmux immediately so you can detach/reattach and open a second window:
+  tmux new-session -s main
+
+Second window (for memory monitoring while pipeline runs):
+  Ctrl+b  c          <- new window
+  Ctrl+b  n/p        <- switch next/prev
+
+
+STEP 2 — INSTALL
+--------------------------------------------------------------------------------
+Run these one at a time inside the instance:
+
+  git clone https://github.com/be2rlab/RADIO-ViPE
+  cd RADIO-ViPE
+  pip install -r envs/requirements.txt
+  TORCH_VER=$(python -c "import torch; print(torch.__version__.split('+')[0])")
+  CUDA_VER=$(python -c "import torch; print('cu' + torch.version.cuda.replace('.', ''))")
+  pip install torch-scatter -f "https://data.pyg.org/whl/torch-${TORCH_VER}+${CUDA_VER}.html"
+  MAX_JOBS=4 pip install --no-build-isolation -e .
+  pip install segment-anything-py
+  pip install --upgrade transformers
+
+Verify:
+  python -c "import vipe; import vipe_ext; print('OK')"
+
+
+STEP 3 — APPLY THE CODE FIX (do this before every run)
+--------------------------------------------------------------------------------
+The upstream repo has a bug: save_slam_map runs AFTER save_viz, so if viz
+crashes (it will — see STEP 5), the map is never saved.
+
+This one-liner fixes it — run from ~/RADIO-ViPE:
+
+  python - <<'EOF'
+  path = "vipe/pipeline/default.py"
+  txt = open(path).read()
+  old = (
+      "            if self.out_cfg.save_viz:\n"
+      "                with profiler_section(\"pipeline.save_visualizations\"):\n"
+      "                    save_projection_video(\n"
+      "                        artifact_path.meta_vis_path,\n"
+      "                        output_stream,\n"
+      "                        slam_output,\n"
+      "                        self.out_cfg.viz_downsample,\n"
+      "                        self.out_cfg.viz_attributes,\n"
+      "                        self.slam_cfg,\n"
+      "                    )\n"
+      "\n"
+      "            if self.out_cfg.save_slam_map and slam_output.slam_map is not None:\n"
+      "                with profiler_section(\"pipeline.save_slam_map\"):\n"
+      "                    logger.info(f\"Saving SLAM map to {artifact_path.slam_map_path}\")\n"
+      "                    slam_output.slam_map.save(artifact_path.slam_map_path)\n"
+  )
+  new = (
+      "            if self.out_cfg.save_slam_map and slam_output.slam_map is not None:\n"
+      "                with profiler_section(\"pipeline.save_slam_map\"):\n"
+      "                    logger.info(f\"Saving SLAM map to {artifact_path.slam_map_path}\")\n"
+      "                    slam_output.slam_map.save(artifact_path.slam_map_path)\n"
+      "\n"
+      "            if self.out_cfg.save_viz:\n"
+      "                with profiler_section(\"pipeline.save_visualizations\"):\n"
+      "                    save_projection_video(\n"
+      "                        artifact_path.meta_vis_path,\n"
+      "                        output_stream,\n"
+      "                        slam_output,\n"
+      "                        self.out_cfg.viz_downsample,\n"
+      "                        self.out_cfg.viz_attributes,\n"
+      "                        self.slam_cfg,\n"
+      "                    )\n"
+  )
+  if old in txt:
+      open(path, "w").write(txt.replace(old, new))
+      print("Fix applied.")
+  elif new in txt:
+      print("Fix already present.")
+  else:
+      print("ERROR: pattern not found — file may have changed. Apply manually.")
+  EOF
+
+If it prints "Fix already present." you're good.
+
+
+STEP 4 — UPLOAD YOUR VIDEO
+--------------------------------------------------------------------------------
+From your LOCAL terminal (not the instance):
+
+  scp -P <PORT> -i ~/.ssh/id_ed25519_vast /path/to/video.mp4 root@<IP>:~/RADIO-ViPE/
+
+Get PORT and IP from the Vast console SSH button.
+
+Check the video FPS on the instance:
+  ffprobe -v error -select_streams v:0 \
+    -show_entries stream=r_frame_rate \
+    -of default=noprint_wrappers=1 video.mp4
+
+If FPS > 15, downsample (phone video is often 60 or 120 fps):
+  ffmpeg -i video.mp4 -vf fps=15 video_15fps.mp4
+
+Always run on the 15fps version. High fps is the main cause of memory crashes.
+
+
+STEP 5 — RUN THE PIPELINE
+--------------------------------------------------------------------------------
+This is the confirmed-working command for a 24 GB instance with a long video.
+Run from ~/RADIO-ViPE:
+
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python run.py pipeline=default \
+    streams=raw_mp4_stream \
+    streams.base_path=video_15fps.mp4 \
+    pipeline.slam.keyframe_depth=unidepth-s \
+    pipeline.slam.buffer=512 \
+    pipeline.slam.pca_dim=64 \
+    pipeline.slam.keyframe_thresh=6.0 \
+    pipeline.slam.visualize=false \
+    pipeline.output.save_viz=false \
+    pipeline.post.depth_align_model=null
+
+Flags explained:
+  buffer=512          Hard limit on total keyframes. Must be > number of keyframes
+                      the video produces. Crash (IndexError) if too small.
+  pca_dim=64          Embedding size per point. Reduces memory ~4x vs default 256.
+  keyframe_thresh=6.0 How aggressively new keyframes are added (default 4.0).
+                      Higher = fewer keyframes = less memory.
+  visualize=false     Disables rerun real-time viz (saves overhead).
+  save_viz=false      CRITICAL. Without this, after SLAM a second copy of the
+                      full model loads for video rendering and OOMs the instance.
+                      The map would not be saved if it crashes.
+  depth_align_model=null  Skips a heavy post-processing step we don't need.
+
+Monitor memory in the second tmux window while it runs:
+  watch -n 3 'cat /sys/fs/cgroup/memory.current | awk "{printf \"%.1f GB\n\", \$1/1024/1024/1024}"'
+
+Expected memory profile:
+  ~11 GB at 140 frames
+  ~20 GB at 500 frames
+  ~35 GB at 1100 frames
+  ~50 GB at end of SLAM — this is normal, do not panic
+  Container limit is 54 GB. With the flags above it stays under.
+
+Expected runtime: 15-30 min for a 1-2 min video at 15fps.
+
+Output files (replace "video_15fps" with your video name):
+  vipe_results/video_15fps/vipe/vid_slam_map.pt   <- the 3D semantic map
+  vipe_results/video_15fps/vipe/pca_basis.pt       <- PCA projection basis
+
+
+STEP 6 — GROUNDING
+--------------------------------------------------------------------------------
+Run on the instance (use --device cpu to avoid VRAM OOM):
+
+  python -m scripts.grounding \
+    vipe_results/video_15fps/vipe/vid_slam_map.pt \
+    --pca-basis vipe_results/video_15fps/vipe/pca_basis.pt \
+    --ground "chair" \
+    --show-object-points \
+    --device cpu
+
+Replace "chair" with whatever you want to find.
+
+Tuning knobs if results are bad:
+  --threshold 0.2     Lower = more points shown (default 0.25). Try 0.15-0.3.
+  --cluster-eps 0.3   DBSCAN radius in metres. Larger = fewer, bigger clusters.
+
+If the terminal says "fallback to top-X points", the embeddings aren't
+discriminative enough — try a higher quality run (larger pca_dim, better depth
+model).
+
+
+STEP 7 — SPEECH CONTEXT (OPTIONAL — improves grounding with narrated video)
+--------------------------------------------------------------------------------
+If you talked while recording ("this is the dairy aisle", etc.), speech context
+can boost grounding accuracy. The speech propagates to all frames in the same
+visual scene, so you don't need to narrate every item — just sections.
+
+Install Whisper (once per instance):
+  pip install openai-whisper
+
+Build the sidecar:
+  python scripts/build_speech_context.py \
+    --video video_15fps.mp4 \
+    --map vipe_results/video_15fps/vipe/vid_slam_map.pt \
+    --output vipe_results/video_15fps/vipe/speech_context.json \
+    --whisper-model base
+
+  Options:
+    --whisper-model   tiny/base/small/medium/large (larger = more accurate)
+    --scene-threshold 0.7  How sensitive scene-change detection is (0-1).
+                           Lower = fewer resets, context travels further.
+
+Ground with speech context:
+  python -m scripts.grounding \
+    vipe_results/video_15fps/vipe/vid_slam_map.pt \
+    --pca-basis vipe_results/video_15fps/vipe/pca_basis.pt \
+    --ground "yogurt" \
+    --speech-context vipe_results/video_15fps/vipe/speech_context.json \
+    --speech-weight 0.3 \
+    --show-object-points \
+    --device cpu
+
+  --speech-weight 0.3   Additive boost to cosine similarity for speech-matched
+                        points. Higher = speech context dominates; lower = visual
+                        similarity dominates. Start at 0.3, go up to 0.5-0.8 if
+                        visual grounding alone is weak.
+
+
+STEP 8 — DOWNLOAD RESULTS
+--------------------------------------------------------------------------------
+From your LOCAL terminal:
+
+  scp -P <PORT> -i ~/.ssh/id_ed25519_vast \
+    -r root@<IP>:~/RADIO-ViPE/vipe_results/video_15fps/vipe \
+    ~/Downloads/vipe_results/
+
+Minimum files needed for grounding locally:
+  vid_slam_map.pt
+  pca_basis.pt
+  speech_context.json  (if you built it)
+
+The map file is ~1-3 GB. Full vipe folder may be larger if artifacts were saved.
+
+
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+Symptom: "IndexError: index N is out of bounds for dimension 0 with size N"
+Fix:     buffer too small. Increase: pipeline.slam.buffer=1024
+
+Symptom: "Killed" with no traceback partway through SLAM
+Fix:     Memory limit hit. Options (use together):
+         - Ensure video is at 15fps (ffmpeg -vf fps=15)
+         - Reduce pca_dim further: pipeline.slam.pca_dim=32
+         - Raise keyframe_thresh: pipeline.slam.keyframe_thresh=8.0
+
+Symptom: "Killed" after SLAM pass 2 completes (near the end)
+Fix:     save_viz=false is missing, or code fix (STEP 3) was not applied.
+         The viz step loads SigLIP2 a second time and OOMs.
+         Check: grep -n "save_slam_map\|save_viz" vipe/pipeline/default.py
+         save_slam_map block must come BEFORE save_viz block.
+
+Symptom: "Could not override 'pipeline.slam.keyframe_interval'"
+Fix:     That key doesn't exist. Use keyframe_thresh instead.
+
+Symptom: Grounding shows nothing / fallback to top-X points
+Fix:     Lower --threshold (try 0.15), increase --cluster-eps (try 0.3-0.5).
+         If still nothing, the map quality may need higher pca_dim (128 or 256)
+         which requires more memory — consider a 48 GB instance.
+
+Symptom: cat /sys/fs/cgroup/memory/memory.usage_in_bytes: No such file
+Fix:     Instance uses cgroup v2. Use:
+         cat /sys/fs/cgroup/memory.current
+================================================================================

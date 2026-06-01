@@ -356,6 +356,8 @@ def visualize_slam_map(
     # Speech context
     speech_context_path: Path | None = None,
     speech_weight: float = 0.3,
+    # Output
+    output_path: Path | None = None,
 ) -> None:
     """Load a SLAM map, render it in Rerun, and optionally highlight a
     grounded text prompt as colored points and per-instance bounding boxes."""
@@ -409,8 +411,11 @@ def visualize_slam_map(
     else:
         scene_rotation = get_scene_orientation(xyz_np)
 
-    # --- Initialize Rerun and log the RGB cloud ---
-    rr.init("SLAM Map Grounding", spawn=True)
+    # --- Initialize Rerun and save to file ---
+    rr.init("SLAM Map Grounding")
+    out_rrd = output_path if output_path is not None else map_path.with_suffix(".rrd")
+    rr.save(str(out_rrd))
+    print(f"Rerun recording → {out_rrd}")
     rr.log(
         "world/points/rgb",
         rr.Points3D(positions=xyz_np, colors=rgb_np, radii=0.01),
@@ -580,7 +585,7 @@ def visualize_slam_map(
         ]),
     )
 
-    print("\nVisualization running in Rerun viewer. Close the viewer to exit.")
+    print(f"\nDone. Download and open locally with:\n  rerun {out_rrd.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +737,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # Output
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Path for the output .rrd file (default: <map_path>.rrd). "
+            "Download this file and open locally with: rerun <file>.rrd"
+        ),
+    )
+
     return parser
 
 
@@ -775,6 +791,7 @@ def main() -> None:
         cluster_min_samples=args.cluster_min_samples,
         speech_context_path=args.speech_context,
         speech_weight=args.speech_weight,
+        output_path=args.output,
     )
 
 

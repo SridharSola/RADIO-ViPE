@@ -38,6 +38,8 @@ class SLAMMap:
     dense_disp_embeddings: torch.Tensor | None = None
     # Optional (M,) bool tensor signaling whether the embedding at the same index is valid
     dense_disp_embedding_valid: torch.Tensor | None = None
+    # Optional (N, 7) camera-to-world SE3 poses per keyframe [tx, ty, tz, qx, qy, qz, qw]
+    keyframe_poses: torch.Tensor | None = None
 
     def scale(self, factor: float):
         self.dense_disp_xyz *= factor
@@ -59,6 +61,9 @@ class SLAMMap:
                 "dense_disp_embedding_valid": None
                 if self.dense_disp_embedding_valid is None
                 else self.dense_disp_embedding_valid.cpu(),
+                "keyframe_poses": None
+                if self.keyframe_poses is None
+                else self.keyframe_poses.cpu(),
                 "device": map_device,
             },
             path,
@@ -83,6 +88,9 @@ class SLAMMap:
             dense_disp_embedding_valid=None
             if data.get("dense_disp_embedding_valid") is None
             else data["dense_disp_embedding_valid"].to(device),
+            keyframe_poses=None
+            if data.get("keyframe_poses") is None
+            else data["keyframe_poses"].to(device),
         )
 
     @staticmethod
@@ -93,6 +101,7 @@ class SLAMMap:
         tstamps: torch.Tensor,
         embeddings: torch.Tensor | None = None,
         embedding_mask: torch.Tensor | None = None,
+        keyframe_poses: torch.Tensor | None = None,
     ):
         """
         xyz: (N, V, H, W, 3)
@@ -135,6 +144,7 @@ class SLAMMap:
             dense_disp_frame_inds=tstamps.tolist(),
             dense_disp_embeddings=embeddings_flat,
             dense_disp_embedding_valid=embedding_valid_flat,
+            keyframe_poses=keyframe_poses,
         )
 
     def has_embeddings(self) -> bool:

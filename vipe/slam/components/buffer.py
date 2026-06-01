@@ -907,6 +907,7 @@ class GraphBuffer:
             self.tstamp[t_range],
             staged_emb[...].permute(0,1,3,4,2),
             staged_valid,
+            keyframe_poses=c2w_se3.data.detach().cpu(),
         )
 
     def log_tracks(self):

@@ -44,7 +44,7 @@ STEP 2 — INSTALL
 --------------------------------------------------------------------------------
 Run these one at a time inside the instance:
 
-  git clone https://github.com/be2rlab/RADIO-ViPE
+  git clone https://github.com/SridharSola/RADIO-ViPE-speech.git RADIO-ViPE
   cd RADIO-ViPE
   pip install -r envs/requirements.txt
   TORCH_VER=$(python -c "import torch; print(torch.__version__.split('+')[0])")
@@ -58,60 +58,9 @@ Verify:
   python -c "import vipe; import vipe_ext; print('OK')"
 
 
-STEP 3 — APPLY THE CODE FIX (do this before every run)
+STEP 3 — APPLY THE CODE FIX
 --------------------------------------------------------------------------------
-The upstream repo has a bug: save_slam_map runs AFTER save_viz, so if viz
-crashes (it will — see STEP 5), the map is never saved.
-
-This one-liner fixes it — run from ~/RADIO-ViPE:
-
-  python - <<'EOF'
-  path = "vipe/pipeline/default.py"
-  txt = open(path).read()
-  old = (
-      "            if self.out_cfg.save_viz:\n"
-      "                with profiler_section(\"pipeline.save_visualizations\"):\n"
-      "                    save_projection_video(\n"
-      "                        artifact_path.meta_vis_path,\n"
-      "                        output_stream,\n"
-      "                        slam_output,\n"
-      "                        self.out_cfg.viz_downsample,\n"
-      "                        self.out_cfg.viz_attributes,\n"
-      "                        self.slam_cfg,\n"
-      "                    )\n"
-      "\n"
-      "            if self.out_cfg.save_slam_map and slam_output.slam_map is not None:\n"
-      "                with profiler_section(\"pipeline.save_slam_map\"):\n"
-      "                    logger.info(f\"Saving SLAM map to {artifact_path.slam_map_path}\")\n"
-      "                    slam_output.slam_map.save(artifact_path.slam_map_path)\n"
-  )
-  new = (
-      "            if self.out_cfg.save_slam_map and slam_output.slam_map is not None:\n"
-      "                with profiler_section(\"pipeline.save_slam_map\"):\n"
-      "                    logger.info(f\"Saving SLAM map to {artifact_path.slam_map_path}\")\n"
-      "                    slam_output.slam_map.save(artifact_path.slam_map_path)\n"
-      "\n"
-      "            if self.out_cfg.save_viz:\n"
-      "                with profiler_section(\"pipeline.save_visualizations\"):\n"
-      "                    save_projection_video(\n"
-      "                        artifact_path.meta_vis_path,\n"
-      "                        output_stream,\n"
-      "                        slam_output,\n"
-      "                        self.out_cfg.viz_downsample,\n"
-      "                        self.out_cfg.viz_attributes,\n"
-      "                        self.slam_cfg,\n"
-      "                    )\n"
-  )
-  if old in txt:
-      open(path, "w").write(txt.replace(old, new))
-      print("Fix applied.")
-  elif new in txt:
-      print("Fix already present.")
-  else:
-      print("ERROR: pattern not found — file may have changed. Apply manually.")
-  EOF
-
-If it prints "Fix already present." you're good.
+Already included in this fork (SridharSola/RADIO-ViPE-speech). Nothing to do.
 
 
 STEP 4 — UPLOAD YOUR VIDEO

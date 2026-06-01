@@ -44,7 +44,7 @@ STEP 2 — INSTALL
 --------------------------------------------------------------------------------
 Run these one at a time inside the instance:
 
-  git clone https://github.com/SridharSola/RADIO-ViPE-speech.git RADIO-ViPE
+  git clone git@github.com:SridharSola/RADIO-ViPE.git RADIO-ViPE
   cd RADIO-ViPE
   pip install -r envs/requirements.txt
   TORCH_VER=$(python -c "import torch; print(torch.__version__.split('+')[0])")

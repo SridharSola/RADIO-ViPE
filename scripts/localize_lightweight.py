@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -165,7 +166,8 @@ def localize(
     print(f"  PCA: {pca_basis.shape[0]}D → {pca_basis.shape[1]}D")
 
     # --- Load RADIO encoder ---
-    print("Loading RADIO encoder ...")
+    print("Loading RADIO encoder (this takes 1-2 min) ...")
+    t0 = time.time()
     encoder = RADSegEncoder(
         model_version=model_version,
         lang_model=lang_model,
@@ -173,28 +175,42 @@ def localize(
         predict=False,
         device=torch_device,
     )
+    print(f"  Encoder ready in {time.time() - t0:.0f}s")
+
+    # --- Count frames to process ---
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    n_to_process = max(1, total_frames // sample_every)
 
     # --- Process video frames ---
     raw_positions = []
-    print("\nLocalising ...")
+    t_start = time.time()
+    print(f"\nLocalising {n_to_process} frames ...")
+
     for frame_idx, rgb in read_video_frames(video_path, sample_every):
         img = preprocess_frame(rgb, torch_device)
 
         with torch.inference_mode():
-            feat_map = encoder.encode_image_to_feat_map(img)          # (1, C, H', W')
-            feat_map = encoder.align_spatial_features_with_language(
-                feat_map, onehot=False
-            )                                                           # (1, C', H', W')
-            global_desc = feat_map.mean(dim=[2, 3]).squeeze(0)         # (C',)
-            compressed = pca_compress(global_desc, pca_mean, pca_basis)  # (K,)
-            compressed = F.normalize(compressed, dim=0)
+            feat_map = encoder.encode_image_to_feat_map(img)
+            feat_map = encoder.align_spatial_features_with_language(feat_map, onehot=False)
+            global_desc = feat_map.mean(dim=[2, 3]).squeeze(0)
+            compressed = F.normalize(pca_compress(global_desc, pca_mean, pca_basis), dim=0)
 
-        sims = (kf_embeddings @ compressed).cpu()                      # (N_kf,)
+        sims = (kf_embeddings @ compressed).cpu()
         best = int(sims.argmax().item())
         raw_positions.append(kf_positions[best])
 
-        if len(raw_positions) % 20 == 0:
-            print(f"  {len(raw_positions)} frames processed ...")
+        n_done = len(raw_positions)
+        if n_done % 5 == 0 or n_done == n_to_process:
+            elapsed = time.time() - t_start
+            fps_proc = n_done / elapsed if elapsed > 0 else 0
+            eta = (n_to_process - n_done) / fps_proc if fps_proc > 0 else 0
+            print(f"  [{n_done}/{n_to_process}]  "
+                  f"{fps_proc:.1f} frames/s  "
+                  f"ETA {eta:.0f}s", end="\r", flush=True)
+
+    print(f"\n  Done in {time.time() - t_start:.0f}s")
 
     if not raw_positions:
         print("No frames processed.")
